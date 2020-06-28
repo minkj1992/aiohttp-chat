@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import functools
 import traceback
 import click
 from aiohttp import web
@@ -17,6 +18,19 @@ jinja_environment = jinja2.Environment(
 )
 
 
+def auth_required(handler):
+    @functools.wraps(handler)
+    async def wrapped(request: web.Request) -> web.Response:
+        session = await get_session(request)
+        user_id = session.get('user_id')
+        if user_id is None:
+            return web.json_response(status=401, data={'status': 'unauthorized'})
+
+        return await handler(request, user_id)
+
+    return wrapped
+
+
 async def index(request: web.Request) -> web.Response:
     """Set user_id to session and template's body,
      if not exist it randomly creates a hex_token for user_id """
@@ -28,19 +42,16 @@ async def index(request: web.Request) -> web.Response:
         user_id = f'user-{secrets.token_hex(8)}'
         session['user_id'] = user_id
     content = template.render({
+        'impl_type': request.app['impl_type'],
         'user_id': user_id,
     })
 
     return web.Response(status=200, body=content, content_type='text/html')
 
 
-async def chat_send(request: web.Request) -> web.Response:
+@auth_required
+async def chat_send(request: web.Request, user_id: str) -> web.Response:
     """Send json response to client and Publish chat_data to Redis"""
-
-    session = await get_session(request)
-    user_id = session.get('user_id')
-    if user_id is None:
-        return web.json_response(status=401, data={'status': 'unauthorized'})
 
     payload = await request.json()
     chat_data = json.dumps({
@@ -52,26 +63,18 @@ async def chat_send(request: web.Request) -> web.Response:
     return web.json_response(status=200, data={'status': 'ok'})
 
 
-async def chat_subscribe(request: web.Request) -> web.Response:
-    app = request.app
-    session = await get_session(request)
-    user_id = session.get('user_id')
-    if user_id is None:
-        return web.json_response(status=401, data={'status': 'unauthorized'})
-
+@auth_required
+async def chat_subscribe(request: web.Request, user_id: str) -> web.Response:
     msg_queue = asyncio.Queue()
-    request_id = f'req-{secrets.token_hex(8)}'
-    app['client_queues'][request_id] = msg_queue
+    request_id = f'ssereq-{secrets.token_hex(8)}'
+    request.app['client_queues'][request_id] = msg_queue
     print(f'subscriber {user_id}:{request_id} started')
 
     try:
-        channels = await app['redis'].subscribe('chat')
-        assert len(channels) == 1
-        channel = channels[0]  # TODO: Redis default?
-
         async with sse_response(request) as response:
             while True:
                 chat_data = await msg_queue.get()
+                print('sse.recv', chat_data)
                 if chat_data is None:
                     break
                 await response.send(json.dumps(chat_data))
@@ -82,7 +85,48 @@ async def chat_subscribe(request: web.Request) -> web.Response:
         traceback.print_exc()
     finally:
         print(f'subscriber {user_id}:{request_id} terminated')
-        del app['client_queues'][request_id]
+        del request.app['client_queues'][request_id]
+
+
+@auth_required
+async def chat_websocket(request: web.Request, user_id: str) -> web.Response:
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    request_id = f'wsreq-{secrets.token_hex(8)}'
+    my_queue = asyncio.Queue()
+    request.app['client_queues'][request_id] = my_queue
+
+    async def chat_recv():
+        try:
+            while True:
+                chat_record = await my_queue.get()
+                print('ws.recv', chat_record)
+                if chat_record is None:
+                    break
+                await ws.send_json(chat_record)
+        except asyncio.CancelledError:
+            pass
+
+    recv_task = asyncio.create_task(chat_recv())
+    print(f'subscriber {user_id}:{request_id} started')
+    try:
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                payload = json.loads(msg.data)
+                chat_record = json.dumps({
+                    'user': user_id,
+                    'time': datetime.utcnow().isoformat(),
+                    'text': payload['text'],
+                })
+                await request.app['redis'].publish('chat', chat_record)
+        return ws
+    except asyncio.CancelledError:
+        recv_task.cancel()
+        await recv_task
+        raise
+    finally:
+        print(f'subscriber {user_id}:{request_id} terminated')
+        del request.app['client_queues'][request_id]
 
 
 async def chat_distribute(app: web.Application) -> None:
@@ -120,7 +164,7 @@ async def app_init(app):
     # Subscriber
     session_storage = RedisStorage(
         await aioredis.create_redis_pool(app['redis_addr'], db=1),  # TODO: (search) 왜 redis_pool 을 2번 생성할까? -> pub/sub?
-        max_age=3600
+        max_age=3600,
     )
     setup_session(app, session_storage)
     app['distributer'] = asyncio.create_task(chat_distribute(app))
@@ -139,7 +183,7 @@ async def app_shutdown(app):
 @click.command()
 @click.option('-h', '--host', default='127.0.0.1')
 @click.option('-p', '--port', default=8080)
-@click.option('-t', '--impl-type', type=click.Choice(['sse', 'websocket']), default='sse')
+@click.option('-t', '--impl-type', type=click.Choice(['sse', 'websocket']), default='websocket')
 def main(host, port, impl_type):
     app = web.Application()
     logging.basicConfig(level=logging.DEBUG)
@@ -147,6 +191,7 @@ def main(host, port, impl_type):
     app.add_routes([
         web.get("/", index),
         web.get("/chat", chat_subscribe),
+        web.get("/chat-ws", chat_websocket),
         web.post("/chat", chat_send),
     ])
 
