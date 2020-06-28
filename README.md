@@ -5,6 +5,12 @@
 
 - skill stack:  aiohttp, redis, JS
 
- 
+## redis setting
+
+
+## How to run
+
+    pip install .
+
 
 

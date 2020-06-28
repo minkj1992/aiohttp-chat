@@ -1,5 +1,7 @@
+import logging
 import asyncio
 import traceback
+import click
 from aiohttp import web
 from aiohttp_session import setup as setup_session, get_session
 from aiohttp_session.redis_storage import RedisStorage
@@ -10,14 +12,16 @@ import jinja2
 import json
 import secrets
 
-jinja_env = jinja2.Environment(loader=jinja2.PackageLoader('mychat', 'templates'))
+jinja_environment = jinja2.Environment(
+    loader=jinja2.FileSystemLoader('./templates/')
+)
 
 
 async def index(request: web.Request) -> web.Response:
     """Set user_id to session and template's body,
      if not exist it randomly creates a hex_token for user_id """
 
-    template = jinja_env.get_template('index.html')
+    template = jinja_environment.get_template('index.html')
     session = await get_session(request)
     user_id = session.get('user_id')
     if user_id is None:
@@ -26,6 +30,7 @@ async def index(request: web.Request) -> web.Response:
     content = template.render({
         'user_id': user_id,
     })
+
     return web.Response(status=200, body=content, content_type='text/html')
 
 
@@ -48,15 +53,16 @@ async def chat_send(request: web.Request) -> web.Response:
 
 
 async def chat_subscribe(request: web.Request) -> web.Response:
+    app = request.app
     session = await get_session(request)
     user_id = session.get('user_id')
     if user_id is None:
         return web.json_response(status=401, data={'status': 'unauthorized'})
 
     msg_queue = asyncio.Queue()
-    request_id = f'req-{session.token_hex(8)}'
-    app['subscribers'][request_id] = asyncio.current_task()
-    print(f'subscriber {user_id}:{request_id} started, tid={asyncio.current_task()}')  # TODO: io tasks log to queue?
+    request_id = f'req-{secrets.token_hex(8)}'
+    app['client_queues'][request_id] = msg_queue
+    print(f'subscriber {user_id}:{request_id} started')
 
     try:
         channels = await app['redis'].subscribe('chat')
@@ -64,24 +70,47 @@ async def chat_subscribe(request: web.Request) -> web.Response:
         channel = channels[0]  # TODO: Redis default?
 
         async with sse_response(request) as response:
-            async for chat_data in channel.iter():
-                chat_data = chat_data.decode('utf8')
-                print(f'subscriber {user_id}:{request_id} recv ', chat_data)
+            while True:
+                chat_data = await msg_queue.get()
                 if chat_data is None:
                     break
-                await response.send(chat_data)
+                await response.send(json.dumps(chat_data))
         return response
 
     # Python 3.8에서 변경: asyncio.CancelledError는 이제 BaseException의 서브 클래스.
-    except Exception as e:
+    except Exception:
         traceback.print_exc()
     finally:
         print(f'subscriber {user_id}:{request_id} terminated')
-        del app['subscribers'][request_id]
+        del app['client_queues'][request_id]
+
+
+async def chat_distribute(app: web.Application) -> None:
+    print('distributer started')
+    redis = await aioredis.create_redis(app['redis_addr'], db=0)
+    try:
+        channels = await redis.subscribe('chat')
+        assert len(channels) == 1
+        channel = channels[0]
+        async for chat_data in channel.iter():
+            chat_data = json.loads(chat_data.decode('utf-8'))
+
+            for queue in app['client_queues'].values():
+                queue.put_nowait(chat_data)
+
+    except Exception:
+        traceback.print_exc()
+    finally:
+        # Logically, we need to "unsubscribe" the channel here,
+        # but the "redis" connection is already kind-of corrupted
+        # due to cancellation.
+        # Just terminate our coroutine and let the Redis server
+        # to recognize connection close as the signal of unsubscribe.
+        print('distributer terminated')
 
 
 async def app_init(app):
-    app['subscribers'] = {}
+    app['client_queues'] = {}
     app['redis_addr'] = ('localhost', 6379)  # TODO: dev ver
 
     # db: num of database instance(only 1) -> SELECT 0
@@ -94,19 +123,27 @@ async def app_init(app):
         max_age=3600
     )
     setup_session(app, session_storage)
+    app['distributer'] = asyncio.create_task(chat_distribute(app))
 
 
 async def app_shutdown(app):
-    subscribers = [*app['subscribers'].values()]
-    for subscriber in subscribers:
-        subscriber.cancel()
-    await asyncio.gather(*subscribers)  # 잔류 데이터 처리
+    client_queues = [*app['client_queues'].values()]
+    for queue in client_queues:
+        queue.put_nowait(None)
+    app['distributer'].cancel()
+    await app['distributer']
     app['redis'].close()  # 스트림과 하부 소켓 Close
     await app['reids'].wait_closed()  # 스트림이 닫힐 때까지 기다립니다. 하부 연결이 닫힐 때까지 기다리려면 close() 뒤에 호출해야 합니다.
 
 
-if __name__ == '__main__':
+@click.command()
+@click.option('-h', '--host', default='127.0.0.1')
+@click.option('-p', '--port', default=8080)
+@click.option('-t', '--impl-type', type=click.Choice(['sse', 'websocket']), default='sse')
+def main(host, port, impl_type):
     app = web.Application()
+    logging.basicConfig(level=logging.DEBUG)
+    app['impl_type'] = impl_type
     app.add_routes([
         web.get("/", index),
         web.get("/chat", chat_subscribe),
@@ -115,4 +152,8 @@ if __name__ == '__main__':
 
     app.on_startup.append(app_init)
     app.on_shutdown.append(app_shutdown)
-    web.run_app(app, host='127.0.0.1', port=8080)
+    web.run_app(app, host=host, port=port)
+
+
+if __name__ == '__main__':
+    main()
