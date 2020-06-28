@@ -26,12 +26,28 @@ async def chat_send():
 
 
 async def app_init(app):
-    pass
+    app['subscribers'] = {}
+    app['redis_addr'] = ('localhost', 6379)  # TODO: dev ver
+
+    # db: num of database instance(only 1) -> SELECT 0
+    # Subscriber
+    app['redis'] = await aioredis.create_redis_pool(app['redis_addr'], db=0)  # TODO: loop를 주지 않는 이유는?
+
+    # Publisher
+    session_storage = RedisStorage(
+        await aioredis.create_redis_pool(app['redis_addr'], db=1),  # TODO: (search) 왜 redis_pool 을 2번 생성할까? -> pub/sub?
+        max_age=3600
+    )
+    setup_session(app, session_storage)
 
 
 async def app_shutdown(app):
-    pass
-
+    subscribers = [*app['subscribers'].values()]
+    for subscriber in subscribers:
+        subscriber.cancel()
+    await asyncio.gather(*subscribers) # 잔류 데이터 처리
+    app['redis'].close() # 스트림과 하부 소켓 Close
+    await app['reids'].wait_closed() # 스트림이 닫힐 때까지 기다립니다. 하부 연결이 닫힐 때까지 기다리려면 close() 뒤에 호출해야 합니다.
 
 if __name__ == '__main__':
     app = web.Application()
